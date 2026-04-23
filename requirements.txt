@@ -1,0 +1,12 @@
+streamlit
+pypdf
+python-docx
+scikit-learn
+numpy
+transformers
+torch
+fpdf2
+pandas
+pillow
+pytesseract
+pymupdf
