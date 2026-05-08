@@ -7,6 +7,7 @@ import streamlit as st
 from auth_backend import init_auth_db, login_user, signup_user
 from document_processing import parse_uploaded_file
 from history_store import load_history, save_history
+from offline_cache import get_offline_cache, is_offline_mode
 from qa_engine import DocumentQA
 from report_helpers import (
     build_report_pdf_bytes,
@@ -38,6 +39,8 @@ def init_state() -> None:
         "show_llm_prompt": False,
         "show_performance_charts": False,
         "force_ocr_pdf": False,
+        "offline_mode": is_offline_mode(),
+        "cached_docs": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -48,7 +51,11 @@ def render_sidebar() -> tuple[bool, str]:
     with st.sidebar:
         st.markdown("## Workspace")
         dark_mode = st.toggle("Dark mode", value=True)
-
+        
+        # Offline mode indicator
+        if st.session_state.offline_mode:
+            st.info("🔌 **Offline Mode Active**")
+        
         if not st.session_state.is_logged_in:
             auth_tab = st.radio("Account", ["Login", "Signup"], horizontal=True)
             if auth_tab == "Signup":
@@ -113,6 +120,7 @@ def render_about_us() -> None:
         - grounded Q&A with context and confidence score
         - summary generation and keyword search
         - multi-document comparison with export options
+        - **offline document caching for working without internet**
         """
     )
 
@@ -198,6 +206,51 @@ def render_settings_panel() -> None:
 
     st.divider()
     st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("### Offline Cache Management")
+    
+    cache = get_offline_cache()
+    cache_size = cache.get_cache_size_mb()
+    st.metric("Cached Data Size", f"{cache_size:.2f} MB")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("📦 Export Cache"):
+            try:
+                cache.export_for_offline("offline_package.zip")
+                with open("offline_package.zip", "rb") as f:
+                    st.download_button(
+                        "Download Offline Package",
+                        f,
+                        "offline_package.zip",
+                        "application/zip"
+                    )
+                st.success("Cache exported successfully!")
+            except Exception as e:
+                st.error(f"Export failed: {e}")
+    
+    with col2:
+        if st.button("📥 View Cached Docs"):
+            cached = cache.list_cached_documents()
+            if cached:
+                st.write("**Cached Documents:**")
+                for doc in cached:
+                    st.write(f"- {doc['name']} ({doc['size_kb']:.1f} KB) - {doc['cached_at']}")
+            else:
+                st.info("No cached documents yet.")
+    
+    with col3:
+        if st.button("🗑️ Clear Cache", key="clear_cache_btn"):
+            if cache.clear_all_cache():
+                st.success("Cache cleared!")
+                st.rerun()
+            else:
+                st.error("Failed to clear cache.")
+    
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### Actions")
     if st.button("Reset to Default Settings"):
         st.session_state.chunk_size = 500
@@ -225,6 +278,8 @@ def handle_uploads() -> None:
         merged_texts = []
         merged_sections = []
         loaded_names = []
+        cache = get_offline_cache()
+        
         for file in uploaded_files:
             try:
                 parsed = parse_uploaded_file(file, force_ocr=st.session_state.force_ocr_pdf)
@@ -233,8 +288,15 @@ def handle_uploads() -> None:
                     [(section.text, f"{parsed.name} | {section.source_label}") for section in parsed.sections]
                 )
                 loaded_names.append(parsed.name)
+                
                 if parsed.name not in st.session_state.history:
                     st.session_state.history.append(parsed.name)
+                
+                # Cache document for offline access
+                sections_data = [{"text": s.text, "label": s.source_label} for s in parsed.sections]
+                if cache.cache_document(parsed.name, parsed.text, sections_data):
+                    st.caption(f"✓ {parsed.name} cached for offline access")
+                    
             except Exception as exc:
                 st.error(f"{file.name}: {exc}")
 
