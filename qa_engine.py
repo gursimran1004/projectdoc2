@@ -101,13 +101,12 @@ def retrieve_top_chunks(
         results = [
             (chunks_with_source[idx][0], chunks_with_source[idx][1], float(similarities[idx]))
             for idx in top_indices
-            if float(similarities[idx]) > 0.0  # Filter out zero scores
         ]
-        return results if results else [(chunks[0], chunks_with_source[0][1], 0.1)]
+        return results if results else [(chunks[0], chunks_with_source[0][1], 0.5)]
     except Exception as e:
         print(f"Error in retrieve_top_chunks: {e}")
         # Fallback: return first chunk
-        return [(chunks[0], chunks_with_source[0][1], 0.1)]
+        return [(chunks[0], chunks_with_source[0][1], 0.5)]
 
 
 class DocumentQA:
@@ -166,7 +165,7 @@ class DocumentQA:
             return True
         short_tokens = sum(1 for w in words if len(w) <= 2)
         uppercase_tokens = sum(1 for w in words if w.isupper() and len(w) > 1)
-        return (short_tokens / len(words)) > 0.35 or uppercase_tokens > 6
+        return (short_tokens / len(words)) > 0.4 or uppercase_tokens > 8
 
     @staticmethod
     def _clean_context_text(text: str) -> str:
@@ -278,11 +277,11 @@ class DocumentQA:
                 result = qa_pipe(question=query, context=best_chunk)
                 answer = (result.get("answer") or "").strip()
                 score = float(result.get("score", 0.0))
-                if answer and not self._looks_noisy(answer):
+                if answer and len(answer) > 3 and not self._looks_noisy(answer):
                     return QAResult(
                         answer=self._clean_answer_text(answer),
                         relevant_passage=self._clean_context_text(best_chunk),
-                        confidence=max(0.5, score),
+                        confidence=min(0.99, max(0.5, score)),
                         source_label=source_label,
                         top_matches=top_hits,
                     )
@@ -296,12 +295,12 @@ class DocumentQA:
                 context = " ".join([chunk for chunk, _, _ in top_hits[:2]])
                 prompt = (
                     "Answer the question using only the context provided. "
-                    "Be concise and accurate.\n\n"
+                    "Be concise and accurate. Give a direct answer.\n\n"
                     f"Question: {query}\n"
                     f"Context: {context}\n"
                     "Answer:"
                 )
-                gen = gen_pipe(prompt, max_new_tokens=100, do_sample=False)
+                gen = gen_pipe(prompt, max_new_tokens=120, do_sample=False)
                 if gen and isinstance(gen, list) and len(gen) > 0:
                     gen_text = (gen[0].get("generated_text") or "").strip()
                     # Remove the prompt from generated text if present
@@ -311,35 +310,51 @@ class DocumentQA:
                         return QAResult(
                             answer=self._clean_answer_text(gen_text),
                             relevant_passage=self._clean_context_text(best_chunk),
-                            confidence=max(0.5, sim_score),
+                            confidence=max(0.5, min(0.9, sim_score)),
                             source_label=source_label,
                             top_matches=top_hits,
                         )
             except Exception as e:
                 print(f"Generation Pipeline error: {e}")
 
-        # Fallback: pick the most relevant sentence
+        # Fallback: Extract and rank sentences by similarity
         candidate_sentences: List[str] = []
-        for hit_chunk, _, _ in top_hits[: max(1, min(3, len(top_hits)))]:
-            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", hit_chunk) if s.strip()]
-            candidate_sentences.extend(sentences)
+        
+        # Split into sentences
+        for hit_chunk, _, _ in top_hits[:2]:
+            # Better sentence splitting
+            sentences = re.split(r'(?<=[.!?])\s+|(?<=[.!?])\n+', hit_chunk)
+            for sent in sentences:
+                sent = sent.strip()
+                if sent and len(sent) > 5:  # Only meaningful sentences
+                    candidate_sentences.append(sent)
 
-        fallback_answer = best_chunk[:300].strip() + "..."
-        if candidate_sentences:
-            try:
-                vectorizer = TfidfVectorizer(stop_words="english", max_features=200)
-                sent_matrix = vectorizer.fit_transform(candidate_sentences + [query])
-                sims = cosine_similarity(sent_matrix[-1], sent_matrix[:-1]).flatten()
-                best_sent_idx = int(np.argmax(sims))
-                fallback_answer = candidate_sentences[best_sent_idx]
-            except Exception as e:
-                print(f"Sentence selection error: {e}")
-                fallback_answer = candidate_sentences[0] if candidate_sentences else fallback_answer
+        if not candidate_sentences:
+            # If no sentences found, use chunk directly
+            candidate_sentences = [best_chunk[:200]]
+
+        # Find most relevant sentence
+        try:
+            vectorizer = TfidfVectorizer(stop_words="english", max_features=200, lowercase=True)
+            sent_matrix = vectorizer.fit_transform(candidate_sentences + [query])
+            sims = cosine_similarity(sent_matrix[-1], sent_matrix[:-1]).flatten()
+            best_sent_idx = int(np.argmax(sims))
+            fallback_answer = candidate_sentences[best_sent_idx]
+            fallback_conf = max(0.3, float(sims[best_sent_idx]))
+        except Exception as e:
+            print(f"Sentence selection error: {e}")
+            fallback_answer = candidate_sentences[0]
+            fallback_conf = 0.4
+
+        # Ensure we have a valid answer
+        if not fallback_answer or len(fallback_answer) < 3:
+            fallback_answer = best_chunk[:150].strip() + "..."
+            fallback_conf = 0.3
 
         return QAResult(
             answer=self._clean_answer_text(fallback_answer),
             relevant_passage=self._clean_context_text(best_chunk),
-            confidence=max(0.3, sim_score),
+            confidence=fallback_conf,
             source_label=source_label,
             top_matches=top_hits,
         )
@@ -362,8 +377,8 @@ class DocumentQA:
                 print(f"Summarization error: {e}")
 
         # Extractive fallback summary
-        sentences = re.split(r"(?<=[.!?])\s+", short_text)
-        top_sentences = [s.strip() for s in sentences[:5] if s.strip()]
+        sentences = re.split(r'(?<=[.!?])\s+|(?<=[.!?])\n+', short_text)
+        top_sentences = [s.strip() for s in sentences[:5] if s.strip() and len(s) > 5]
         return " ".join(top_sentences) if top_sentences else "Summary unavailable."
 
     def solve_mcq(
@@ -412,7 +427,7 @@ class DocumentQA:
 
             src = top_hits[0][1]
             explanation = (
-                f"Selected option '{selected}' based on highest similarity with document context. "
+                f"Selected '{selected}' based on highest similarity with document context. "
                 f"Source: {src}"
             )
             return MCQResult(selected_option=selected, confidence=max(0.3, best_score), explanation=explanation)
@@ -421,5 +436,5 @@ class DocumentQA:
             return MCQResult(
                 selected_option=valid_options[0],
                 confidence=0.2,
-                explanation=f"Error in analysis, selected first option as fallback.",
+                explanation="Fallback: selected first option.",
             )
